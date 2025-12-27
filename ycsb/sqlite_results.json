@@ -1,0 +1,46 @@
+{
+  "benchmark": "SQLite",
+  "timestamp": "2025-12-27T11:42:25+00:00",
+  "results": [
+    {
+      "workload": "workloada",
+      "filesystem": "SwornDisk",
+      "throughput_ops_sec": 17684.1
+    }    ,
+    {
+      "workload": "workloada",
+      "filesystem": "CryptDisk",
+      "throughput_ops_sec": 14536.8
+    }    ,
+    {
+      "workload": "workloadb",
+      "filesystem": "SwornDisk",
+      "throughput_ops_sec": 16683.0
+    }    ,
+    {
+      "workload": "workloadb",
+      "filesystem": "CryptDisk",
+      "throughput_ops_sec": 15580.4
+    }    ,
+    {
+      "workload": "workloade",
+      "filesystem": "SwornDisk",
+      "throughput_ops_sec": 16785.3
+    }    ,
+    {
+      "workload": "workloade",
+      "filesystem": "CryptDisk",
+      "throughput_ops_sec": 16460.6
+    }    ,
+    {
+      "workload": "workloadf",
+      "filesystem": "SwornDisk",
+      "throughput_ops_sec": 19021.0
+    }    ,
+    {
+      "workload": "workloadf",
+      "filesystem": "CryptDisk",
+      "throughput_ops_sec": 16725.7
+    }
+  ]
+}
