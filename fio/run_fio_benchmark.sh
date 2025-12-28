@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# ============================================================
+# DEVICE PATH CONFIGURATION (modify these paths as needed)
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+# ============================================================
+# Script Configuration
+# ============================================================
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[1;31m'
@@ -41,10 +50,10 @@ declare -A TEST_TYPES=(
 # Disk types to test
 DISK_TYPES=("sworndisk" "cryptdisk")
 
-# Test file paths on mounted filesystems
-declare -A TEST_FILE_PATHS
-TEST_FILE_PATHS["sworndisk"]="/home/yxy/ssd/fast26_ae/sev/data/sworndisk-fio-test"
-TEST_FILE_PATHS["cryptdisk"]="/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-fio-test"
+# Block device paths for direct testing (no filesystem)
+declare -A DEVICE_PATHS
+DEVICE_PATHS["sworndisk"]="$SWORNDISK_DEVICE"
+DEVICE_PATHS["cryptdisk"]="$CRYPTDISK_DEVICE"
 
 function check_fio() {
     if ! command -v fio &> /dev/null; then
@@ -55,52 +64,58 @@ function check_fio() {
     echo -e "${GREEN}Found fio: $(fio --version)${NC}"
 }
 
-function check_path() {
-    local path=$1
-    local parent_dir=$(dirname "$path")
+function check_device() {
+    local device=$1
 
-    if [ ! -d "$parent_dir" ]; then
-        echo -e "${RED}Error: Directory $parent_dir not found${NC}"
-        echo -e "${YELLOW}Please ensure the filesystem is mounted at $parent_dir${NC}"
+    if [ ! -e "$device" ]; then
+        echo -e "${RED}Error: Device $device not found${NC}"
+        echo -e "${YELLOW}Please ensure the device mapper is set up correctly${NC}"
         return 1
     fi
 
-    if [ ! -w "$parent_dir" ]; then
-        echo -e "${RED}Error: Directory $parent_dir is not writable${NC}"
+    if [ ! -b "$device" ]; then
+        echo -e "${RED}Error: $device is not a block device${NC}"
         return 1
     fi
 
-    echo -e "${GREEN}Path $parent_dir is accessible${NC}"
+    if [ ! -r "$device" ] || [ ! -w "$device" ]; then
+        echo -e "${RED}Error: Device $device is not readable/writable${NC}"
+        echo -e "${YELLOW}You may need root permissions to access block devices${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}Device $device is accessible${NC}"
     return 0
 }
 
-function cleanup_file() {
-    local test_file=$1
-    echo -e "${YELLOW}Cleaning up test file ${test_file}...${NC}"
-    rm -f "$test_file"
+function sync_device() {
+    local device=$1
+    echo -e "${YELLOW}Syncing device ${device}...${NC}"
     sync
-    echo -e "${GREEN}Cleanup complete${NC}"
+    # Wait for pending I/O to complete
+    sleep 1
+    echo -e "${GREEN}Sync complete${NC}"
 }
 
 function run_fio_section() {
     local disk_type=$1
     local section=$2
-    local test_file=$3
+    local device=$3
     local output_file=$4
     local config=${5:-$FIO_CONFIG}
 
-    echo -e "${GREEN}Running fio [${section}] on ${disk_type} (file: ${test_file})...${NC}"
-    fio --filename="${test_file}" "${SCRIPT_DIR}/configs/${config}" --section="${section}" 2>&1 | tee "${output_file}"
+    echo -e "${GREEN}Running fio [${section}] on ${disk_type} (device: ${device})...${NC}"
+    fio --filename="${device}" "${SCRIPT_DIR}/configs/${config}" --section="${section}" 2>&1 | tee "${output_file}"
 }
 
 function run_fio_all_sections() {
     local disk_type=$1
-    local test_file=$2
+    local device=$2
     local config=$3
     local output_file=$4
 
-    echo -e "${GREEN}Running all fio sections on ${disk_type} (file: ${test_file})...${NC}"
-    fio --filename="${test_file}" "${SCRIPT_DIR}/configs/${config}" 2>&1 | tee "${output_file}"
+    echo -e "${GREEN}Running all fio sections on ${disk_type} (device: ${device})...${NC}"
+    fio --filename="${device}" "${SCRIPT_DIR}/configs/${config}" 2>&1 | tee "${output_file}"
 }
 
 function parse_single_result() {
@@ -146,34 +161,35 @@ function main() {
     check_fio
 
     echo -e "\n${YELLOW}========== Starting FIO Benchmark ==========${NC}\n"
+    echo -e "${YELLOW}Testing block devices directly (no filesystem)${NC}\n"
 
     local results=()
 
     for disk_type in "${DISK_TYPES[@]}"; do
         echo -e "\n${YELLOW}========== Testing ${disk_type} ==========${NC}\n"
-        local test_file=${TEST_FILE_PATHS[$disk_type]}
+        local device=${DEVICE_PATHS[$disk_type]}
 
-        # Check if path is accessible
-        if ! check_path "$test_file"; then
-            echo -e "${RED}Skipping ${disk_type} - path not accessible${NC}"
+        # Check if device is accessible
+        if ! check_device "$device"; then
+            echo -e "${RED}Skipping ${disk_type} - device not accessible${NC}"
             continue
         fi
 
         declare -A metrics=()
 
-        # Write tests: clean up test file before each test
+        # Write tests: sync device before each test
         for section in "${WRITE_TESTS[@]}"; do
-            cleanup_file "$test_file"
+            sync_device "$device"
             local output_file="${OUTPUT_DIR}/${disk_type}_${section}_output.txt"
-            run_fio_section "$disk_type" "$section" "$test_file" "$output_file"
+            run_fio_section "$disk_type" "$section" "$device" "$output_file"
             metrics[${TEST_KEYS[$section]}]=$(parse_single_result "$output_file" "${TEST_TYPES[$section]}")
             echo -e "${GREEN}${section}: ${metrics[${TEST_KEYS[$section]}]} MiB/s${NC}"
         done
 
         # Read tests: prepare data once, then run all read tests
-        cleanup_file "$test_file"
+        sync_device "$device"
         local read_output_file="${OUTPUT_DIR}/${disk_type}_read_output.txt"
-        run_fio_all_sections "$disk_type" "$test_file" "reproduce-read.fio" "$read_output_file"
+        run_fio_all_sections "$disk_type" "$device" "reproduce-read.fio" "$read_output_file"
 
         # Parse results for each read test from combined output
         for section in "${READ_TESTS[@]}"; do
@@ -181,8 +197,8 @@ function main() {
             echo -e "${GREEN}${section}: ${metrics[${TEST_KEYS[$section]}]} MiB/s${NC}"
         done
 
-        # Cleanup after all tests
-        cleanup_file "$test_file"
+        # Sync after all tests
+        sync_device "$device"
 
         results+=("{\"disk_type\":\"${disk_type}\",\"seq_write_256k\":${metrics[seq_write_256k]:-0},\"rand_write_4k\":${metrics[rand_write_4k]:-0},\"rand_write_32k\":${metrics[rand_write_32k]:-0},\"rand_write_256k\":${metrics[rand_write_256k]:-0},\"seq_read_256k\":${metrics[seq_read_256k]:-0},\"rand_read_4k\":${metrics[rand_read_4k]:-0},\"rand_read_32k\":${metrics[rand_read_32k]:-0},\"rand_read_256k\":${metrics[rand_read_256k]:-0}}")
     done

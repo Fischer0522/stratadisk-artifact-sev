@@ -4,7 +4,7 @@
 
 [global]
 ioengine=sync
-size=40G
+size=10G
 thread=1
 numjobs=1
 direct=1

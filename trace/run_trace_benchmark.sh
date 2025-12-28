@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# ============================================================
+# DEVICE PATH CONFIGURATION (modify these paths as needed)
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+# ============================================================
+# Script Configuration
+# ============================================================
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[1;31m'
@@ -10,16 +19,19 @@ SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
 TRACE_DIR="${SCRIPT_DIR}/msr-test"
 
+# Reset script for sworndisk (run after each trace test)
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
+
 # Trace datasets (only the 0-variants)
 TRACES=("hm_0" "mds_0" "prn_0" "wdev_0" "web_0")
 
 # Disk types to test
 DISK_TYPES=("sworndisk" "cryptdisk")
 
-# File paths in data directory
-declare -A FILE_PATHS
-FILE_PATHS["sworndisk"]="/home/yxy/ssd/fast26_ae/sev/data/sworndisk-diskfile"
-FILE_PATHS["cryptdisk"]="/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-diskfile"
+# Block device paths for direct testing (no filesystem)
+declare -A DEVICE_PATHS
+DEVICE_PATHS["sworndisk"]="$SWORNDISK_DEVICE"
+DEVICE_PATHS["cryptdisk"]="$CRYPTDISK_DEVICE"
 
 function check_compiler() {
     if ! command -v g++ &> /dev/null; then
@@ -55,46 +67,69 @@ function compile_trace() {
     echo -e "${GREEN}Compilation successful${NC}"
 }
 
-function check_filesystem() {
-    local disk_type=$1
-    local file_path=${FILE_PATHS[$disk_type]}
-    local parent_dir=$(dirname "$file_path")
+function check_device() {
+    local device=$1
 
-    if [ ! -d "$parent_dir" ]; then
-        echo -e "${RED}Error: Directory $parent_dir not found${NC}"
-        echo -e "${YELLOW}Please ensure the filesystem is mounted at $parent_dir${NC}"
+    if [ ! -e "$device" ]; then
+        echo -e "${RED}Error: Device $device not found${NC}"
+        echo -e "${YELLOW}Please ensure the device mapper is set up correctly${NC}"
         return 1
     fi
 
-    if [ ! -w "$parent_dir" ]; then
-        echo -e "${RED}Error: Directory $parent_dir is not writable${NC}"
+    if [ ! -b "$device" ]; then
+        echo -e "${RED}Error: $device is not a block device${NC}"
         return 1
     fi
 
-    echo -e "${GREEN}Filesystem at $parent_dir is accessible${NC}"
+    if [ ! -r "$device" ] || [ ! -w "$device" ]; then
+        echo -e "${RED}Error: Device $device is not readable/writable${NC}"
+        echo -e "${YELLOW}You may need root permissions to access block devices${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}Device $device is accessible${NC}"
     return 0
 }
 
-function cleanup_diskfile() {
-    local file_path=$1
-    echo -e "${YELLOW}Cleaning up disk file ${file_path}...${NC}"
-    rm -f "$file_path"
+function sync_device() {
+    local device=$1
+    echo -e "${YELLOW}Syncing device ${device}...${NC}"
     sync
-    echo -e "${GREEN}Cleanup complete${NC}"
+    # Wait for pending I/O to complete
+    sleep 1
+    echo -e "${GREEN}Sync complete${NC}"
+}
+
+function reset_sworndisk() {
+    if [ ! -f "$RESET_SWORN_SCRIPT" ]; then
+        echo -e "${RED}Error: Reset script not found at $RESET_SWORN_SCRIPT${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Resetting sworndisk...${NC}"
+    bash "$RESET_SWORN_SCRIPT"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Sworndisk reset complete${NC}"
+        return 0
+    else
+        echo -e "${RED}Error: Failed to reset sworndisk${NC}"
+        return 1
+    fi
 }
 
 function run_trace_test() {
     local disk_type=$1
     local trace_file=$2
-    local file_path=${FILE_PATHS[$disk_type]}
+    local device=${DEVICE_PATHS[$disk_type]}
     local output_file="${OUTPUT_DIR}/${trace_file}_${disk_type}_output.txt"
 
     echo -e "${GREEN}Running trace [${trace_file}] on ${disk_type}...${NC}"
-    echo -e "${GREEN}File path: ${file_path}${NC}"
+    echo -e "${GREEN}Device path: ${device}${NC}"
     echo -e "${GREEN}Trace file: ${TRACE_DIR}/${trace_file}.csv${NC}"
 
     # Run the trace program
-    "${SCRIPT_DIR}/trace" "${file_path}" "${TRACE_DIR}/${trace_file}.csv" 2>&1 | tee "${output_file}"
+    "${SCRIPT_DIR}/trace" "${device}" "${TRACE_DIR}/${trace_file}.csv" 2>&1 | tee "${output_file}"
 }
 
 function parse_results() {
@@ -102,7 +137,7 @@ function parse_results() {
     local disk_type=$2
     local output_file="${OUTPUT_DIR}/${trace_file}_${disk_type}_output.txt"
 
-    local bandwidth=$(grep "^Bandwidth:" "${output_file}" 2>/dev/null | awk '{print $2}' | sed 's/MiB\/s//')
+    local bandwidth=$(grep "^Avg Bandwidth:" "${output_file}" 2>/dev/null | awk '{print $3}' | sed 's/MiB\/s//')
 
     echo "{\"trace\":\"${trace_file}\",\"disk_type\":\"${disk_type}\",\"bandwidth_mb_s\":${bandwidth:-0}}"
 }
@@ -115,28 +150,29 @@ function main() {
     compile_trace
 
     echo -e "\n${YELLOW}========== Starting Trace Benchmark ==========${NC}\n"
+    echo -e "${YELLOW}Testing block devices directly (no filesystem)${NC}\n"
 
     RESULT_JSON="${OUTPUT_DIR}/result.json"
     all_results=()
 
     # Iterate disks, then traces
-    # For sworndisk and cryptdisk, clean up before each trace run
+    # For sworndisk and cryptdisk, sync device before and after each trace run
     for disk_type in "${DISK_TYPES[@]}"; do
         echo -e "\n${YELLOW}===== Testing ${disk_type} =====${NC}\n"
 
-        local file_path=${FILE_PATHS[$disk_type]}
+        local device=${DEVICE_PATHS[$disk_type]}
 
-        # Check if filesystem is accessible
-        if ! check_filesystem "$disk_type"; then
-            echo -e "${RED}Skipping ${disk_type} - filesystem not accessible${NC}"
+        # Check if device is accessible
+        if ! check_device "$device"; then
+            echo -e "${RED}Skipping ${disk_type} - device not accessible${NC}"
             continue
         fi
 
         for trace_file in "${TRACES[@]}"; do
             echo -e "\n${YELLOW}========== Testing ${trace_file} on ${disk_type} ==========${NC}\n"
 
-            # Clean up before each test
-            cleanup_diskfile "$file_path"
+            # Sync before each test
+            sync_device "$device"
 
             # Run trace test
             run_trace_test "$disk_type" "$trace_file"
@@ -144,8 +180,13 @@ function main() {
             # Parse and store results
             all_results+=("$(parse_results "$trace_file" "$disk_type")")
 
-            # Clean up after test
-            cleanup_diskfile "$file_path"
+            # Sync after test
+            sync_device "$device"
+
+            # Reset sworndisk after each trace test
+            if [ "$disk_type" == "sworndisk" ]; then
+                reset_sworndisk
+            fi
         done
     done
 

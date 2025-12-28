@@ -1,6 +1,19 @@
 #!/bin/bash
 set -e
 
+# ============================================================
+# DEVICE PATH CONFIGURATION (modify these paths as needed)
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+# Mount points for filesystems
+SWORNDISK_MOUNT="/root/sworndisk"
+CRYPTDISK_MOUNT="/root/cryptdisk"
+
+# ============================================================
+# Script Configuration
+# ============================================================
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[1;31m'
@@ -8,7 +21,10 @@ NC='\033[0m'
 
 SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
-DATA_DIR="/home/yxy/ssd/fast26_ae/sev/data"
+
+# Reset and mount scripts
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
+MOUNT_SCRIPT="${SCRIPT_DIR}/../mount_filesystems.sh"
 
 # Workloads to test
 WORKLOADS=("fileserver" "oltp" "varmail" "videoserver")
@@ -16,10 +32,20 @@ WORKLOADS=("fileserver" "oltp" "varmail" "videoserver")
 # Disk types to test
 DISK_TYPES=("sworndisk" "cryptdisk")
 
-# Test directory paths for each disk type (in data directory)
+# Block device paths
+declare -A DEVICE_PATHS
+DEVICE_PATHS["sworndisk"]="$SWORNDISK_DEVICE"
+DEVICE_PATHS["cryptdisk"]="$CRYPTDISK_DEVICE"
+
+# Mount points for each disk type
+declare -A MOUNT_POINTS
+MOUNT_POINTS["sworndisk"]="$SWORNDISK_MOUNT"
+MOUNT_POINTS["cryptdisk"]="$CRYPTDISK_MOUNT"
+
+# Test directory paths for each disk type (on mounted filesystems)
 declare -A TEST_DIRS
-TEST_DIRS["sworndisk"]="${DATA_DIR}/sworndisk-filebench"
-TEST_DIRS["cryptdisk"]="${DATA_DIR}/cryptdisk-filebench"
+TEST_DIRS["sworndisk"]="${SWORNDISK_MOUNT}/filebench-test"
+TEST_DIRS["cryptdisk"]="${CRYPTDISK_MOUNT}/filebench-test"
 
 function usage() {
     echo "Usage: $0 [workload]"
@@ -45,18 +71,82 @@ function check_filebench() {
     echo -e "${GREEN}Found filebench: $(filebench -h 2>&1 | head -1 || echo 'installed')${NC}"
 }
 
-function check_data_dir() {
-    if [ ! -d "$DATA_DIR" ]; then
-        echo -e "${YELLOW}Creating data directory: $DATA_DIR${NC}"
-        mkdir -p "$DATA_DIR"
+function check_mount_point() {
+    local mountpoint=$1
+
+    if ! mountpoint -q "$mountpoint"; then
+        echo -e "${RED}Error: $mountpoint is not mounted${NC}"
+        echo -e "${YELLOW}Please run mount_filesystems.sh first${NC}"
+        return 1
     fi
 
-    if [ ! -w "$DATA_DIR" ]; then
-        echo -e "${RED}Error: Data directory $DATA_DIR is not writable${NC}"
-        exit 1
+    if [ ! -w "$mountpoint" ]; then
+        echo -e "${RED}Error: $mountpoint is not writable${NC}"
+        return 1
     fi
 
-    echo -e "${GREEN}Data directory is accessible${NC}"
+    echo -e "${GREEN}Mount point $mountpoint is accessible${NC}"
+    return 0
+}
+
+function reset_sworndisk() {
+    if [ ! -f "$RESET_SWORN_SCRIPT" ]; then
+        echo -e "${RED}Error: Reset script not found at $RESET_SWORN_SCRIPT${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Resetting sworndisk...${NC}"
+    bash "$RESET_SWORN_SCRIPT"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Sworndisk reset complete${NC}"
+        return 0
+    else
+        echo -e "${RED}Error: Failed to reset sworndisk${NC}"
+        return 1
+    fi
+}
+
+function umount_filesystem() {
+    local mountpoint=$1
+
+    if ! mountpoint -q "$mountpoint"; then
+        echo -e "${YELLOW}$mountpoint is not mounted, skipping umount${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}Unmounting filesystem at $mountpoint...${NC}"
+    umount "$mountpoint"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Filesystem unmounted successfully${NC}"
+        sync
+        sleep 1
+        return 0
+    else
+        echo -e "${RED}Error: Failed to unmount filesystem${NC}"
+        return 1
+    fi
+}
+
+function remount_filesystem() {
+    local disk_type=$1
+
+    if [ ! -f "$MOUNT_SCRIPT" ]; then
+        echo -e "${RED}Error: Mount script not found at $MOUNT_SCRIPT${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Remounting filesystem for $disk_type...${NC}"
+    bash "$MOUNT_SCRIPT"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Filesystem remounted successfully${NC}"
+        return 0
+    else
+        echo -e "${RED}Error: Failed to remount filesystem${NC}"
+        return 1
+    fi
 }
 
 function generate_workload_file() {
@@ -115,6 +205,13 @@ function run_single_workload() {
     for disk_type in "${DISK_TYPES[@]}"; do
         echo -e "\n${YELLOW}========== Testing ${workload} on ${disk_type} ==========${NC}\n"
 
+        # Check if mount point is accessible
+        local mountpoint=${MOUNT_POINTS[$disk_type]}
+        if ! check_mount_point "$mountpoint"; then
+            echo -e "${RED}Skipping ${disk_type} - mount point not accessible${NC}"
+            continue
+        fi
+
         # Generate workload file with correct path
         local workload_file=$(generate_workload_file "$workload" "$disk_type" 2>/dev/null)
         if [ $? -ne 0 ]; then
@@ -129,6 +226,17 @@ function run_single_workload() {
 
         # Clean up test directory after running
         cleanup_test_dir "${TEST_DIRS[$disk_type]}"
+
+        # Reset and remount for sworndisk
+        if [ "$disk_type" == "sworndisk" ]; then
+            echo -e "\n${YELLOW}Resetting and remounting sworndisk...${NC}"
+            # Step 1: Unmount filesystem
+            umount_filesystem "$mountpoint"
+            # Step 2: Reset device
+            reset_sworndisk
+            # Step 3: Remount filesystem
+            remount_filesystem "$disk_type"
+        fi
     done
 }
 
@@ -137,9 +245,16 @@ function main() {
 
     mkdir -p "${OUTPUT_DIR}"
     check_filebench
-    check_data_dir
 
     echo -e "\n${YELLOW}========== Starting Filebench Benchmark ==========${NC}\n"
+    echo -e "${YELLOW}Testing on mounted filesystems${NC}\n"
+
+    # Ensure filesystems are mounted
+    echo -e "${YELLOW}Checking filesystems...${NC}"
+    if ! check_mount_point "${SWORNDISK_MOUNT}" || ! check_mount_point "${CRYPTDISK_MOUNT}"; then
+        echo -e "\n${YELLOW}Filesystems not mounted. Mounting now...${NC}"
+        remount_filesystem "all"
+    fi
 
     if [ "$selected_workload" == "all" ]; then
         for workload in "${WORKLOADS[@]}"; do
