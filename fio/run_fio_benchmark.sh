@@ -20,6 +20,9 @@ FIO_CONFIG="reproduce.fio"
 OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
 RESULT_JSON="${OUTPUT_DIR}/result.json"
 
+# Reset script for sworndisk (run after each write test)
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
+
 # Test sections
 WRITE_TESTS=("seq-write-256k" "rand-write-4k" "rand-write-32k" "rand-write-256k")
 READ_TESTS=("seq-read-256k" "rand-read-4k" "rand-read-32k" "rand-read-256k")
@@ -95,6 +98,24 @@ function sync_device() {
     # Wait for pending I/O to complete
     sleep 1
     echo -e "${GREEN}Sync complete${NC}"
+}
+
+function reset_sworndisk() {
+    if [ ! -f "$RESET_SWORN_SCRIPT" ]; then
+        echo -e "${RED}Error: Reset script not found at $RESET_SWORN_SCRIPT${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Resetting sworndisk...${NC}"
+    bash "$RESET_SWORN_SCRIPT"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Sworndisk reset complete${NC}"
+        return 0
+    else
+        echo -e "${RED}Error: Failed to reset sworndisk${NC}"
+        return 1
+    fi
 }
 
 function run_fio_section() {
@@ -177,13 +198,18 @@ function main() {
 
         declare -A metrics=()
 
-        # Write tests: sync device before each test
+        # Write tests: sync device before each test, reset sworndisk after each write test
         for section in "${WRITE_TESTS[@]}"; do
             sync_device "$device"
             local output_file="${OUTPUT_DIR}/${disk_type}_${section}_output.txt"
             run_fio_section "$disk_type" "$section" "$device" "$output_file"
             metrics[${TEST_KEYS[$section]}]=$(parse_single_result "$output_file" "${TEST_TYPES[$section]}")
             echo -e "${GREEN}${section}: ${metrics[${TEST_KEYS[$section]}]} MiB/s${NC}"
+
+            # Reset sworndisk after each write test
+            if [ "$disk_type" == "sworndisk" ]; then
+                reset_sworndisk
+            fi
         done
 
         # Read tests: prepare data once, then run all read tests

@@ -4,13 +4,13 @@
 
 [global]
 ioengine=sync
-size=4G
+size=40G
 thread=1
 numjobs=1
 direct=1
 fsync_on_close=1
 time_based=1
-runtime=10
+runtime=20
 
 # Sequential Write Tests
 [seq-write-256k]

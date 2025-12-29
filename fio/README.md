@@ -1,12 +1,14 @@
 # FIO Benchmark for SEV
 
-This directory contains scripts to benchmark SwornDisk and CryptDisk using FIO (Flexible I/O Tester) on the data directory.
+This directory contains scripts to benchmark SwornDisk and CryptDisk using FIO (Flexible I/O Tester) with direct block device access.
 
 ## Overview
 
-The benchmark tests filesystem performance by creating test files in the data directory, comparing:
-- **SwornDisk**: `/home/yxy/ssd/fast26_ae/sev/data/sworndisk-fio-test`
-- **CryptDisk**: `/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-fio-test`
+The benchmark tests raw block device performance by directly accessing device mapper devices, comparing:
+- **SwornDisk**: `/dev/mapper/test-sworndisk`
+- **CryptDisk**: `/dev/mapper/test-crypt` (dm-crypt + dm-integrity)
+
+The tests run directly on block devices without filesystem overhead, providing more accurate low-level I/O performance measurements.
 
 ## Test Configuration
 
@@ -14,13 +16,15 @@ The benchmark tests filesystem performance by creating test files in the data di
 - Sequential Write (256KB blocks)
 - Random Write (4KB, 32KB, 256KB blocks)
 
-Each write test removes the test file before running to ensure clean state.
+**For SwornDisk**: Each write test is followed by a device reset using `reset_sworn.sh` to ensure clean state and prevent space exhaustion.
+
+**For CryptDisk**: No reset needed as it's in-place encryption.
 
 ### Read Tests
 - Sequential Read (256KB blocks)
 - Random Read (4KB, 32KB, 256KB blocks)
 
-Read tests prepare data once, then run all tests sequentially on the same data.
+Read tests prepare data once, then run all tests sequentially on the same data. **No device reset is performed for read tests.**
 
 ## Prerequisites
 
@@ -34,25 +38,39 @@ Read tests prepare data once, then run all tests sequentially on the same data.
    sudo apt install -y python3-matplotlib python3-numpy
    ```
 
-3. Ensure the data directory exists and is writable:
+3. Ensure block devices are set up:
+   - SwornDisk device mapper: `/dev/mapper/test-sworndisk`
+   - CryptDisk device mapper: `/dev/mapper/test-crypt`
+
+   Use the provided reset scripts to initialize devices:
    ```bash
-   mkdir -p /home/yxy/ssd/fast26_ae/sev/data
+   # Initialize SwornDisk
+   ./reset_sworn.sh
+
+   # Initialize CryptDisk (if needed)
+   ./reset_crypt.sh
    ```
+
+4. **Root/sudo access required**: Direct block device access requires root permissions
 
 ## Usage
 
 ### Run Benchmark
 
+**Note**: You must run the benchmark with root/sudo privileges for block device access:
+
 ```bash
-cd /home/yxy/ssd/fast26_ae/sev/fio
-./run_fio_benchmark.sh
+cd fio
+sudo ./run_fio_benchmark.sh
 ```
 
 The script will:
 1. Check for FIO installation
-2. Verify data directory exists and is writable
-3. Run write tests (removing test file before each test)
-4. Run read tests (preparing data once)
+2. Verify block devices are accessible
+3. Run write tests on both devices
+   - For SwornDisk: After each write test, the device is reset using `reset_sworn.sh`
+   - For CryptDisk: No reset needed (in-place encryption)
+4. Run read tests (preparing data once for all read tests)
 5. Generate results in `benchmark_results/result.json`
 
 ### Plot Results
@@ -122,25 +140,42 @@ fio/
 
 ## Notes
 
-- Tests run on the data directory, not raw block devices
-- Test files: `/home/yxy/ssd/fast26_ae/sev/data/sworndisk-fio-test` and `/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-fio-test`
-- Write tests clean up before each run to ensure fresh state
-- Read tests reuse the same prepared data
+- **Direct block device testing**: Tests run directly on `/dev/mapper/test-sworndisk` and `/dev/mapper/test-crypt`, not on filesystems
+- **SwornDisk reset**: After each write test, SwornDisk is reset to prevent space exhaustion
+- **CryptDisk behavior**: No reset needed as CryptDisk uses in-place encryption
+- **Read tests**: No device reset performed for read-only operations
 - Tests run with `direct=1` to bypass page cache
-- Default test duration: 10s for writes, 20s for reads
-- Default test size: 40GB
+- Default test duration: 10 seconds per test
+- Default test size: 4GB
+- **Requires root access**: Block device operations require sudo/root privileges
 
 ## Customization
 
+### Test Parameters
+
 To adjust test parameters, edit `configs/reproduce.fio` and `configs/reproduce-read.fio`:
-- `runtime`: Test duration in seconds
-- `size`: File/device size
-- `bs`: Block size
+- `runtime`: Test duration in seconds (default: 10s)
+- `size`: Test size (default: 4GB)
+- `bs`: Block size (varies by test: 4k, 32k, 256k)
 - `direct`: Direct I/O flag (1=bypass cache, 0=use cache)
 
-To change file paths, edit `run_fio_benchmark.sh` line 46-47:
+### Device Paths
+
+To change device paths, edit the top of `run_fio_benchmark.sh`:
+
 ```bash
-TEST_FILE_PATHS["sworndisk"]="/home/yxy/ssd/fast26_ae/sev/data/sworndisk-fio-test"
-TEST_FILE_PATHS["cryptdisk"]="/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-fio-test"
+# ============================================================
+# DEVICE PATH CONFIGURATION (modify these paths as needed)
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+```
+
+### Reset Script Location
+
+If your `reset_sworn.sh` is in a different location, update:
+
+```bash
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
 ```
 

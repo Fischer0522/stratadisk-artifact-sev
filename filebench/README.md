@@ -1,12 +1,14 @@
 # Filebench Benchmark for SEV
 
-This directory contains scripts to benchmark SwornDisk and CryptDisk using Filebench workloads on the data directory.
+This directory contains scripts to benchmark SwornDisk and CryptDisk using Filebench workloads on mounted filesystems.
 
 ## Overview
 
-Filebench is a file system and storage benchmark that can generate complex workloads. This benchmark tests:
-- **SwornDisk**: `/home/yxy/ssd/fast26_ae/sev/data/sworndisk-filebench/`
-- **CryptDisk**: `/home/yxy/ssd/fast26_ae/sev/data/cryptdisk-filebench/`
+Filebench is a file system and storage benchmark that can generate complex workloads. This benchmark tests filesystems mounted on block devices:
+- **SwornDisk**: `/dev/mapper/test-sworndisk` mounted at `/root/sworndisk`
+- **CryptDisk**: `/dev/mapper/test-crypt` (dm-crypt + dm-integrity) mounted at `/root/cryptdisk`
+
+Tests run on filesystems (ext4) mounted on these block devices, providing filesystem-level performance measurements with real-world workload patterns.
 
 ## Workloads
 
@@ -31,7 +33,7 @@ Four Filebench workloads are tested:
 
    **Method 2: Build from source (for latest version)**
    ```bash
-   cd /home/yxy/ssd/fast26_ae/sev/filebench
+   cd filebench
    ./download_and_build_filebench.sh
    ```
 
@@ -45,10 +47,30 @@ Four Filebench workloads are tested:
    sudo apt install -y python3-matplotlib python3-numpy
    ```
 
-3. Ensure the data directory exists and is writable:
+3. Ensure block devices are set up:
+   - SwornDisk device mapper: `/dev/mapper/test-sworndisk`
+   - CryptDisk device mapper: `/dev/mapper/test-crypt`
+
+   Use the provided reset scripts to initialize devices:
    ```bash
-   mkdir -p /home/yxy/ssd/fast26_ae/sev/data
+   # Initialize SwornDisk
+   ../reset_sworn.sh
+
+   # Initialize CryptDisk (if needed)
+   ../reset_crypt.sh
    ```
+
+4. Mount filesystems on block devices:
+   ```bash
+   # Mount filesystems (creates ext4 filesystems and mounts them)
+   sudo ../mount_filesystems.sh
+   ```
+
+   This will mount:
+   - SwornDisk at `/root/sworndisk`
+   - CryptDisk at `/root/cryptdisk`
+
+5. **Root/sudo access required**: Filesystem mounting and block device operations require root permissions
 
 ## How It Works
 
@@ -60,14 +82,18 @@ Workload template files (in `workloads/`) contain Filebench configuration with a
 
 The script:
 1. Checks for Filebench installation
-2. For each workload and disk type:
+2. Checks if filesystems are mounted (if not, mounts them automatically)
+3. For each workload and disk type:
+   - Checks mount point is accessible
    - Generates a workload file with the correct path
    - Cleans up the test directory
-   - Runs Filebench
+   - Runs Filebench on the mounted filesystem
    - Collects output
    - Cleans up after test
-3. Parses results using `parse_filebench_results.sh`
-4. Generates `benchmark_results/result.json`
+   - **For SwornDisk**: Unmounts filesystem, resets device using `reset_sworn.sh`, remounts filesystem
+   - **For CryptDisk**: No reset needed (in-place encryption)
+4. Parses results using `parse_filebench_results.sh`
+5. Generates `benchmark_results/result.json`
 
 ### Parse Script (parse_filebench_results.sh)
 
@@ -84,20 +110,28 @@ Generates a bar chart comparing SwornDisk and CryptDisk across all workloads.
 
 ### Run All Workloads
 
+**Note**: You must run the benchmark with root/sudo privileges for filesystem and block device operations:
+
 ```bash
-cd /home/yxy/ssd/fast26_ae/sev/filebench
-./run_filebench_benchmark.sh
+cd filebench
+sudo ./run_filebench_benchmark.sh
 ```
 
 This will run all 4 workloads on both disk types (8 tests total).
 
+The script will:
+- Check if filesystems are mounted, and mount them if needed
+- Run each workload on SwornDisk and CryptDisk
+- After each SwornDisk workload: unmount, reset device, remount filesystem
+- CryptDisk workloads run without device reset
+
 ### Run Single Workload
 
 ```bash
-./run_filebench_benchmark.sh fileserver
-./run_filebench_benchmark.sh oltp
-./run_filebench_benchmark.sh varmail
-./run_filebench_benchmark.sh videoserver
+sudo ./run_filebench_benchmark.sh fileserver
+sudo ./run_filebench_benchmark.sh oltp
+sudo ./run_filebench_benchmark.sh varmail
+sudo ./run_filebench_benchmark.sh videoserver
 ```
 
 ### Plot Results
@@ -172,23 +206,43 @@ filebench/
 
 ## Notes
 
-- Tests run on the data directory with regular directories
+- **Filesystem testing**: Tests run on ext4 filesystems mounted on block devices
+- **Mount points**: `/root/sworndisk` and `/root/cryptdisk`
+- **SwornDisk reset**: After each workload, SwornDisk filesystem is unmounted, device is reset, then remounted to prevent space exhaustion
+- **CryptDisk behavior**: No reset needed as CryptDisk uses in-place encryption
 - Test directories are cleaned before and after each test
 - Each workload runs for **60 seconds**
 - **Multi-threaded** workloads (16-48 threads depending on workload)
 - **File pre-allocation** enabled for most workloads
 - Complex file operations including writewholefile, appendfilerand, fsync
-- **Estimated test duration: ~5-10 minutes for all workloads**
+- **Requires root access**: Filesystem mounting and block device operations require sudo/root privileges
+- **Estimated test duration: ~10-15 minutes for all workloads** (including reset/remount time)
 
 ## Customization
 
-### Change Test Directory
+### Device and Mount Paths
 
-Edit `run_filebench_benchmark.sh` lines 18-19:
+To change device paths and mount points, edit the top of `run_filebench_benchmark.sh`:
 
 ```bash
-TEST_DIRS["sworndisk"]="${DATA_DIR}/sworndisk-filebench"
-TEST_DIRS["cryptdisk"]="${DATA_DIR}/cryptdisk-filebench"
+# ============================================================
+# DEVICE PATH CONFIGURATION (modify these paths as needed)
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+# Mount points for filesystems
+SWORNDISK_MOUNT="/root/sworndisk"
+CRYPTDISK_MOUNT="/root/cryptdisk"
+```
+
+### Reset and Mount Scripts
+
+If your scripts are in different locations, update:
+
+```bash
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
+MOUNT_SCRIPT="${SCRIPT_DIR}/../mount_filesystems.sh"
 ```
 
 ### Modify Workload Parameters
@@ -227,17 +281,51 @@ If filebench is not installed:
 sudo apt install -y filebench
 ```
 
+### Filesystems Not Mounted
+
+If the script reports filesystems are not mounted:
+```bash
+# Check mount status
+mount | grep -E "sworndisk|cryptdisk"
+
+# Mount filesystems manually
+sudo ../mount_filesystems.sh
+
+# Verify mounts
+df -h | grep -E "sworndisk|cryptdisk"
+```
+
+### Block Devices Not Found
+
+Ensure block devices are set up correctly:
+```bash
+# Check if devices exist
+ls -l /dev/mapper/test-sworndisk
+ls -l /dev/mapper/test-crypt
+
+# Check device status
+sudo dmsetup status test-sworndisk
+sudo dmsetup status test-crypt
+
+# If devices don't exist, initialize them
+sudo ../reset_sworn.sh
+sudo ../reset_crypt.sh
+```
+
 ### Permission Denied
 
-Ensure the data directory is writable:
+Ensure you're running with sudo:
 ```bash
-ls -ld /home/yxy/ssd/fast26_ae/sev/data
-chmod 755 /home/yxy/ssd/fast26_ae/sev/data
+sudo ./run_filebench_benchmark.sh
 ```
 
 ### Filebench Crashes or Hangs
 
-- Check if there's enough disk space (videoserver needs ~35GB+ per disk)
+- Check if there's enough space on mounted filesystems (videoserver needs ~35GB+ per filesystem)
+  ```bash
+  df -h /root/sworndisk /root/cryptdisk
+  ```
+- SwornDisk may exhaust space quickly - the device will be reset after each workload automatically
 - Try reducing the number of files or threads in template files
 - Try reducing prealloc percentage or removing it: `prealloc=50` or no prealloc parameter
 - For videoserver, reduce file size: `set $filesize=128m` instead of 1g
