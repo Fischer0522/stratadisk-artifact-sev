@@ -1,8 +1,8 @@
 # Workload C: Read only workload
 # 100% read
 
-recordcount=10000
-operationcount=10000
+recordcount=100000
+operationcount=100000
 workload=core
 
 fieldcount=10

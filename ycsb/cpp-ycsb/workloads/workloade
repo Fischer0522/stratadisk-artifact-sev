@@ -1,8 +1,8 @@
 # Workload E: Scan workload
 # 95% scan, 5% insert
 
-recordcount=10000
-operationcount=10000
+recordcount=100000
+operationcount=100000
 workload=core
 
 fieldcount=10

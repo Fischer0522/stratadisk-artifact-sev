@@ -4,10 +4,10 @@
 # DEVICE AND MOUNT PATH CONFIGURATION
 # ============================================================
 SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
-SWORNDISK_MOUNT="/root/sworndisk"
+SWORNDISK_MOUNT="/mnt/sworndisk"
 
 CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
-CRYPTDISK_MOUNT="/root/cryptdisk"
+CRYPTDISK_MOUNT="/mnt/cryptdisk"
 
 # Filesystem type (ext4, xfs, etc.)
 FS_TYPE="ext4"

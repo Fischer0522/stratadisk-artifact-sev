@@ -8,8 +8,8 @@ SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
 CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
 
 # Mount points for filesystems
-SWORNDISK_MOUNT="/root/sworndisk"
-CRYPTDISK_MOUNT="/root/cryptdisk"
+SWORNDISK_MOUNT="/mnt/sworndisk"
+CRYPTDISK_MOUNT="/mnt/cryptdisk"
 
 # ============================================================
 # Script Configuration

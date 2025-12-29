@@ -5,16 +5,34 @@
 
 set -e
 
+# ============================================================
+# DEVICE & FILESYSTEM PATHS
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+SWORNDISK_MOUNT="/mnt/sworndisk"
+CRYPTDISK_MOUNT="/mnt/cryptdisk"
+
+# Data roots on each mounted filesystem
+SWORNDISK_DATA_ROOT="${SWORNDISK_MOUNT}/ycsb"
+CRYPTDISK_DATA_ROOT="${CRYPTDISK_MOUNT}/ycsb"
+
+# Reset and mount helpers
+SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+MOUNT_SCRIPT="${SCRIPT_DIR}/../mount_filesystems.sh"
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
+OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
+
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[1;31m'
 BLUE='\033[1;34m'
 NC='\033[0m'
 
-SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 YCSB_BIN="${SCRIPT_DIR}/go-ycsb/bin/go-ycsb"
 WORKLOAD_DIR="${SCRIPT_DIR}/go-ycsb/workloads"
-RESULT_FILE="${SCRIPT_DIR}/boltdb_results.json"
+RESULT_FILE="${OUTPUT_DIR}/boltdb_results.json"
 
 # Check if go-ycsb binary exists
 if [ ! -f "${YCSB_BIN}" ]; then
@@ -33,9 +51,77 @@ fi
 WORKLOADS=("workloada" "workloadb" "workloade" "workloadf")
 
 # Test database files (BoltDB is a single-file database)
-DATA_DIR="/home/yxy/ssd/fast26_ae/sev/data"
-SWORNDISK_FILE="${DATA_DIR}/sworndisk-boltdb.db"
-CRYPTDISK_FILE="${DATA_DIR}/cryptdisk-boltdb.db"
+SWORNDISK_FILE="${SWORNDISK_DATA_ROOT}/boltdb.db"
+CRYPTDISK_FILE="${CRYPTDISK_DATA_ROOT}/boltdb.db"
+
+check_mount_point() {
+    local mountpoint=$1
+
+    if ! mountpoint -q "$mountpoint"; then
+        return 1
+    fi
+
+    if [ ! -w "$mountpoint" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_filesystems() {
+    local ready=true
+
+    if ! check_mount_point "${SWORNDISK_MOUNT}"; then
+        ready=false
+    fi
+    if ! check_mount_point "${CRYPTDISK_MOUNT}"; then
+        ready=false
+    fi
+
+    if [ "$ready" = false ]; then
+        echo -e "${YELLOW}Mounting filesystems...${NC}"
+        if [ ! -x "${MOUNT_SCRIPT}" ]; then
+            echo -e "${RED}Mount script not found at ${MOUNT_SCRIPT}${NC}"
+            exit 1
+        fi
+        bash "${MOUNT_SCRIPT}"
+    fi
+
+    if ! check_mount_point "${SWORNDISK_MOUNT}" || ! check_mount_point "${CRYPTDISK_MOUNT}"; then
+        echo -e "${RED}Error: filesystems not mounted or writable${NC}"
+        exit 1
+    fi
+}
+
+umount_if_mounted() {
+    local mountpoint=$1
+    if mountpoint -q "$mountpoint"; then
+        echo -e "${YELLOW}Unmounting ${mountpoint}...${NC}"
+        umount "$mountpoint" || echo -e "${RED}Failed to unmount ${mountpoint}${NC}"
+    fi
+}
+
+reset_sworndisk() {
+    if [ -x "${RESET_SWORN_SCRIPT}" ]; then
+        echo -e "${YELLOW}Resetting sworndisk...${NC}"
+        bash "${RESET_SWORN_SCRIPT}" || echo -e "${RED}Failed to reset sworndisk${NC}"
+    else
+        echo -e "${YELLOW}Reset script not found at ${RESET_SWORN_SCRIPT}${NC}"
+    fi
+}
+
+CLEANUP_ENABLED=false
+
+cleanup() {
+    if [ "${CLEANUP_ENABLED}" != true ]; then
+        return
+    fi
+    umount_if_mounted "${SWORNDISK_MOUNT}"
+    umount_if_mounted "${CRYPTDISK_MOUNT}"
+    reset_sworndisk
+}
+
+trap cleanup EXIT
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}BoltDB Benchmark - go-ycsb${NC}"
@@ -46,6 +132,7 @@ echo "Results will be saved to: ${RESULT_FILE}"
 echo ""
 
 # Initialize JSON results file
+mkdir -p "${OUTPUT_DIR}"
 echo "{" > "${RESULT_FILE}"
 echo "  \"benchmark\": \"BoltDB\"," >> "${RESULT_FILE}"
 echo "  \"timestamp\": \"$(date -Iseconds)\"," >> "${RESULT_FILE}"
@@ -102,8 +189,10 @@ run_benchmark() {
     rm -f "${output}"
 }
 
-# Create data directory if it doesn't exist
-mkdir -p "${DATA_DIR}"
+# Ensure filesystems are mounted and data roots exist
+ensure_filesystems
+CLEANUP_ENABLED=true
+mkdir -p "${SWORNDISK_DATA_ROOT}" "${CRYPTDISK_DATA_ROOT}"
 
 # Test each workload on both filesystems
 for workload in "${WORKLOADS[@]}"; do

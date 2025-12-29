@@ -1,29 +1,44 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Script to run PostgreSQL benchmarks using go-ycsb
-# Tests workloads a, b, e, f on SwornDisk and CryptDisk instances
+# Optimized for QEMU/Device-Mapper Environment compatibility
 
 set -e
 
+# ============================================================
+# CONFIGURATION & PATHS
+# ============================================================
+SWORNDISK_MOUNT="/mnt/sworndisk"
+CRYPTDISK_MOUNT="/mnt/cryptdisk"
+
+# Data roots
+SWORNDISK_DATA_ROOT="${SWORNDISK_MOUNT}/ycsb"
+CRYPTDISK_DATA_ROOT="${CRYPTDISK_MOUNT}/ycsb"
+
+# Directories for pg_ctl checks
+SWORNDISK_DIR="${SWORNDISK_DATA_ROOT}/postgres"
+CRYPTDISK_DIR="${CRYPTDISK_DATA_ROOT}/postgres"
+
+SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+YCSB_BIN="${SCRIPT_DIR}/go-ycsb/bin/go-ycsb"
+WORKLOAD_DIR="${SCRIPT_DIR}/go-ycsb/workloads"
+OUTPUT_DIR="${SCRIPT_DIR}/benchmark_results"
+RESULT_FILE="${OUTPUT_DIR}/postgres_results.json"
+
+# Colors
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 RED='\033[1;31m'
 BLUE='\033[1;34m'
 NC='\033[0m'
+GRAY='\033[1;30m'
 
-SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
-YCSB_BIN="${SCRIPT_DIR}/go-ycsb/bin/go-ycsb"
-WORKLOAD_DIR="${SCRIPT_DIR}/go-ycsb/workloads"
-RESULT_FILE="${SCRIPT_DIR}/postgres_results.json"
-
-# Check if go-ycsb binary exists
+# Check prerequisites
 if [ ! -f "${YCSB_BIN}" ]; then
     echo -e "${RED}Error: go-ycsb binary not found at ${YCSB_BIN}${NC}"
-    echo -e "${YELLOW}Please run: cd go-ycsb && make${NC}"
     exit 1
 fi
 
-# Check if workload directory exists
 if [ ! -d "${WORKLOAD_DIR}" ]; then
     echo -e "${RED}Error: workload directory not found at ${WORKLOAD_DIR}${NC}"
     exit 1
@@ -32,205 +47,182 @@ fi
 # Workloads to test
 WORKLOADS=("workloada" "workloadb" "workloade" "workloadf")
 
-# PostgreSQL connection parameters
+# Database Connection Params
 PG_USER="root"
 PG_PASSWORD="root"
 PG_DB="test"
-PG_HOST="localhost"
-
-# Port configuration (matching configure_postgres.sh)
+PG_HOST="127.0.0.1" 
 SWORNDISK_PORT=5433
 CRYPTDISK_PORT=5434
 
-# Data directories (for reference)
-DATA_DIR="/home/yxy/ssd/fast26_ae/sev/data"
-SWORNDISK_DIR="${DATA_DIR}/sworndisk-postgres"
-CRYPTDISK_DIR="${DATA_DIR}/cryptdisk-postgres"
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}PostgreSQL Benchmark - go-ycsb${NC}"
-echo -e "${BLUE}========================================${NC}"
-echo ""
-echo "Workloads to test: ${WORKLOADS[@]}"
-echo "Results will be saved to: ${RESULT_FILE}"
-echo ""
-
-# Initialize JSON results file
-echo "{" > "${RESULT_FILE}"
-echo "  \"benchmark\": \"PostgreSQL\"," >> "${RESULT_FILE}"
-echo "  \"timestamp\": \"$(date -Iseconds)\"," >> "${RESULT_FILE}"
-echo "  \"results\": [" >> "${RESULT_FILE}"
-
-FIRST_RESULT=true
-
-# Function to check if PostgreSQL instance is running
-check_instance() {
+check_instance_ready() {
     local name=$1
     local port=$2
     local data_dir=$3
 
+    # 1. Check process
     if [ ! -f "${data_dir}/postmaster.pid" ]; then
-        echo -e "${RED}Error: ${name} PostgreSQL instance is not running${NC}"
-        echo "Start it with: ./configure_postgres.sh start $(echo $name | tr '[:upper:]' '[:lower:]')"
         return 1
     fi
-
     local pid=$(head -1 "${data_dir}/postmaster.pid")
     if ! ps -p $pid > /dev/null 2>&1; then
-        echo -e "${RED}Error: ${name} PostgreSQL instance is not running${NC}"
-        echo "Start it with: ./configure_postgres.sh start $(echo $name | tr '[:upper:]' '[:lower:]')"
         return 1
     fi
 
-    # Check if YCSB database exists
-    if ! PGPASSWORD=${PG_PASSWORD} psql -h ${PG_HOST} -p ${port} -U ${PG_USER} -d ${PG_DB} -c '\q' 2>/dev/null; then
-        echo -e "${RED}Error: YCSB database not initialized on ${name}${NC}"
-        echo "Initialize it with: ./configure_postgres.sh init-ycsb $(echo $name | tr '[:upper:]' '[:lower:]')"
+    # 2. Check TCP connectivity
+    if ! PGPASSWORD=${PG_PASSWORD} psql -h ${PG_HOST} -p ${port} -U ${PG_USER} -d ${PG_DB} -c '\q' >/dev/null 2>&1; then
+        echo -e "${RED}Error: Cannot connect to ${name} via TCP port ${port}.${NC}"
         return 1
     fi
 
     return 0
 }
 
-# Function to clean up YCSB tables
-cleanup_ycsb_tables() {
+cleanup_ycsb_table() {
     local port=$1
-
-    echo -e "${YELLOW}Cleaning up YCSB tables...${NC}"
-    PGPASSWORD=${PG_PASSWORD} psql -h ${PG_HOST} -p ${port} -U ${PG_USER} -d ${PG_DB} > /dev/null 2>&1 <<EOF
-DROP TABLE IF EXISTS usertable;
-EOF
+    echo -e "${YELLOW}   -> Dropping old 'usertable'...${NC}"
+    PGPASSWORD=${PG_PASSWORD} psql -h ${PG_HOST} -p ${port} -U ${PG_USER} -d ${PG_DB} -c "DROP TABLE IF EXISTS usertable;" >/dev/null 2>&1
 }
 
-# Function to run benchmark for a specific workload and instance
 run_benchmark() {
     local workload=$1
     local name=$2
     local port=$3
 
     echo -e "${YELLOW}----------------------------------------${NC}"
-    echo -e "${YELLOW}Testing: ${name} - ${workload}${NC}"
+    echo -e "${YELLOW}Testing: ${name} @ Port ${port} - ${workload}${NC}"
     echo -e "${YELLOW}----------------------------------------${NC}"
-    echo ""
 
-    # Clean up tables from previous runs
-    cleanup_ycsb_tables ${port}
+    # 1. Clean old data
+    echo -ne "${GRAY}   -> Cleaning old tables... ${NC}"
+    if cleanup_ycsb_table ${port}; then
+        echo -e "${GREEN}Done.${NC}"
+    else
+        echo -e "${RED}Failed. Skipping.${NC}"
+        return 1
+    fi
 
-    # Load phase
-    echo -e "${GREEN}[1/2] Loading data...${NC}"
+    # 2. Load Phase
+    echo -e "${GREEN}   [1/2] Loading data...${NC}"
     "${YCSB_BIN}" load pg -P "${WORKLOAD_DIR}/${workload}" \
         -p pg.host="${PG_HOST}" \
         -p pg.port="${port}" \
         -p pg.user="${PG_USER}" \
         -p pg.password="${PG_PASSWORD}" \
-        -p pg.db="${PG_DB}"
+        -p pg.db="${PG_DB}" \
+        -p pg.sslmode=disable \
+        > /dev/null 2>&1
 
-    echo ""
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}   Load failed! Skipping run.${NC}"
+        return 1
+    fi
 
-    # Run phase
-    echo -e "${GREEN}[2/2] Running benchmark...${NC}"
-    local output=$(mktemp)
+    # 3. Run Phase
+    echo -e "${GREEN}   [2/2] Running benchmark...${NC}"
+    local output_file=$(mktemp)
+    
     "${YCSB_BIN}" run pg -P "${WORKLOAD_DIR}/${workload}" \
         -p pg.host="${PG_HOST}" \
         -p pg.port="${port}" \
         -p pg.user="${PG_USER}" \
         -p pg.password="${PG_PASSWORD}" \
         -p pg.db="${PG_DB}" \
-        2>&1 | tee "${output}"
+        -p pg.sslmode=disable \
+        2>&1 | tee "${output_file}"
 
+    # 4. Parse Results (CRITICAL FIX HERE)
+    # 使用 tail -n 1 确保只获取最后一行 (Run finished 之后的那行 TOTAL)
+    # 避免抓取到中间的进度报告 (Takes 10s, Takes 20s...)
+    local throughput=$(grep -i "TOTAL" "${output_file}" | tail -n 1 | sed -nE 's/.*(OPS|Ops\/Sec):\s*([0-9.]+).*/\2/p')
+
+    # Fallback if empty
+    if [ -z "$throughput" ]; then
+        throughput="0"
+    fi
+
+    echo -e "${BLUE}   Result: ${throughput} Ops/Sec${NC}"
     echo ""
 
-    # Extract throughput from output (OPS from TOTAL line after "Run finished")
-    local throughput=$(grep "^TOTAL" "${output}" | tail -1 | sed -n 's/.*OPS: \([0-9.]*\).*/\1/p')
-
-    # Add result to JSON
-    if [ "${FIRST_RESULT}" = true ]; then
+    # 5. Write JSON
+    if [ "$FIRST_RESULT" = true ]; then
         FIRST_RESULT=false
     else
         echo "    ," >> "${RESULT_FILE}"
     fi
 
+    # 使用 echo 写入，避免 cat 兼容性问题
     echo "    {" >> "${RESULT_FILE}"
     echo "      \"workload\": \"${workload}\"," >> "${RESULT_FILE}"
     echo "      \"filesystem\": \"${name}\"," >> "${RESULT_FILE}"
     echo "      \"port\": ${port}," >> "${RESULT_FILE}"
-    echo "      \"throughput_ops_sec\": ${throughput:-0}" >> "${RESULT_FILE}"
-    echo -n "    }" >> "${RESULT_FILE}"
+    echo "      \"throughput_ops_sec\": ${throughput}" >> "${RESULT_FILE}"
+    echo "    }" >> "${RESULT_FILE}"
 
-    rm -f "${output}"
+    rm -f "${output_file}"
 }
 
-# Check if both instances are running
-echo -e "${YELLOW}Checking PostgreSQL instances...${NC}"
-echo ""
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
 
-SWORNDISK_RUNNING=false
-CRYPTDISK_RUNNING=false
+echo -e "${BLUE}========================================${NC}"
+echo -e "${BLUE}PostgreSQL Benchmark - go-ycsb${NC}"
+echo -e "${BLUE}========================================${NC}"
 
-if check_instance "SwornDisk" ${SWORNDISK_PORT} "${SWORNDISK_DIR}"; then
-    echo -e "${GREEN}✓ SwornDisk instance is ready (port ${SWORNDISK_PORT})${NC}"
-    SWORNDISK_RUNNING=true
+# Check Instances
+SWORNDISK_READY=false
+CRYPTDISK_READY=false
+
+if check_instance_ready "CryptDisk" ${CRYPTDISK_PORT} "${CRYPTDISK_DIR}"; then
+    CRYPTDISK_READY=true
+    echo -e "${GREEN}✓ CryptDisk Ready (Port ${CRYPTDISK_PORT})${NC}"
 else
-    echo -e "${YELLOW}⚠ SwornDisk instance will be skipped${NC}"
+    echo -e "${YELLOW}⚠ CryptDisk NOT ready (Skipping)${NC}"
 fi
-echo ""
 
-if check_instance "CryptDisk" ${CRYPTDISK_PORT} "${CRYPTDISK_DIR}"; then
-    echo -e "${GREEN}✓ CryptDisk instance is ready (port ${CRYPTDISK_PORT})${NC}"
-    CRYPTDISK_RUNNING=true
+if check_instance_ready "SwornDisk" ${SWORNDISK_PORT} "${SWORNDISK_DIR}"; then
+    SWORNDISK_READY=true
+    echo -e "${GREEN}✓ SwornDisk Ready (Port ${SWORNDISK_PORT})${NC}"
 else
-    echo -e "${YELLOW}⚠ CryptDisk instance will be skipped${NC}"
+    echo -e "${YELLOW}⚠ SwornDisk NOT ready (Skipping)${NC}"
 fi
-echo ""
 
-if [ "$SWORNDISK_RUNNING" = false ] && [ "$CRYPTDISK_RUNNING" = false ]; then
-    echo -e "${RED}Error: No PostgreSQL instances are running${NC}"
+if [ "$SWORNDISK_READY" = false ] && [ "$CRYPTDISK_READY" = false ]; then
     echo ""
-    echo "To set up and start instances:"
-    echo "  ./configure_postgres.sh init sworndisk"
-    echo "  ./configure_postgres.sh start sworndisk"
-    echo "  ./configure_postgres.sh init-ycsb sworndisk"
-    echo ""
-    echo "  ./configure_postgres.sh init cryptdisk"
-    echo "  ./configure_postgres.sh start cryptdisk"
-    echo "  ./configure_postgres.sh init-ycsb cryptdisk"
+    echo -e "${RED}No running instances found.${NC}"
     exit 1
 fi
 
-# Test each workload on available instances
-for workload in "${WORKLOADS[@]}"; do
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}Workload: ${workload}${NC}"
-    echo -e "${BLUE}========================================${NC}"
-    echo ""
+# Initialize JSON
+mkdir -p "${OUTPUT_DIR}"
+echo "{" > "${RESULT_FILE}"
+echo "  \"benchmark\": \"PostgreSQL YCSB\"," >> "${RESULT_FILE}"
+echo "  \"timestamp\": \"$(date)\"," >> "${RESULT_FILE}"
+echo "  \"results\": [" >> "${RESULT_FILE}"
 
-    # Test on SwornDisk if running
-    if [ "$SWORNDISK_RUNNING" = true ]; then
+FIRST_RESULT=true
+
+# Loop through workloads
+echo ""
+for workload in "${WORKLOADS[@]}"; do
+    if [ "$SWORNDISK_READY" = true ]; then
         run_benchmark "${workload}" "SwornDisk" ${SWORNDISK_PORT}
     fi
-
-    # Test on CryptDisk if running
-    if [ "$CRYPTDISK_RUNNING" = true ]; then
+    
+    if [ "$CRYPTDISK_READY" = true ]; then
         run_benchmark "${workload}" "CryptDisk" ${CRYPTDISK_PORT}
     fi
-
-    echo ""
 done
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}All PostgreSQL benchmarks completed!${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
-echo "Tested workloads:"
-for workload in "${WORKLOADS[@]}"; do
-    echo "  - ${workload}"
-done
-echo ""
-
-# Close JSON file
+# Close JSON
 echo "" >> "${RESULT_FILE}"
 echo "  ]" >> "${RESULT_FILE}"
 echo "}" >> "${RESULT_FILE}"
 
-echo -e "${GREEN}Results saved to: ${RESULT_FILE}${NC}"
-echo ""
+echo -e "${GREEN}Benchmark complete.${NC}"
+echo -e "Results saved to: ${BLUE}${RESULT_FILE}${NC}"

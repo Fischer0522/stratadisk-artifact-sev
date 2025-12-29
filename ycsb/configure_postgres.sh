@@ -1,9 +1,26 @@
 #!/bin/bash
 
 # Script to initialize and manage PostgreSQL instances on SwornDisk/CryptDisk
-# Each instance is independent with its own data directory
+# Optimized for Minimal QEMU/Device-Mapper Development Environment
 
 set -e
+
+# ============================================================
+# DEVICE & FILESYSTEM PATHS
+# ============================================================
+SWORNDISK_DEVICE="/dev/mapper/test-sworndisk"
+CRYPTDISK_DEVICE="/dev/mapper/test-crypt"
+
+SWORNDISK_MOUNT="/mnt/sworndisk"
+CRYPTDISK_MOUNT="/mnt/cryptdisk"
+
+# Data roots on each mounted filesystem
+SWORNDISK_DATA_ROOT="${SWORNDISK_MOUNT}/ycsb"
+CRYPTDISK_DATA_ROOT="${CRYPTDISK_MOUNT}/ycsb"
+
+SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+MOUNT_SCRIPT="${SCRIPT_DIR}/../mount_filesystems.sh"
+RESET_SWORN_SCRIPT="${SCRIPT_DIR}/../reset_sworn.sh"
 
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
@@ -12,116 +29,127 @@ BLUE='\033[1;34m'
 NC='\033[0m'
 
 # Configuration
-DATA_DIR="/home/yxy/ssd/fast26_ae/sev/data"
-SWORNDISK_DIR="${DATA_DIR}/sworndisk-postgres"
-CRYPTDISK_DIR="${DATA_DIR}/cryptdisk-postgres"
+SWORNDISK_DIR="${SWORNDISK_DATA_ROOT}/postgres"
+CRYPTDISK_DIR="${CRYPTDISK_DATA_ROOT}/postgres"
 POSTGRES_USER="postgres"
 
-# Port configuration (to avoid conflict with system PostgreSQL)
+# Port configuration
 SWORNDISK_PORT=5433
 CRYPTDISK_PORT=5434
 
-# Detect PostgreSQL version
-POSTGRES_VERSION=$(psql --version 2>/dev/null | grep -oP '\d+' | head -1 || echo "")
+# Detect PostgreSQL version (Fixed for minimal environments without grep -P)
+# Added || true to prevent set -e from exiting if psql is missing during check
+POSTGRES_VERSION=$(psql --version 2>/dev/null | awk '{print $3}' | awk -F. '{print $1}' || true)
 
 if [ -z "$POSTGRES_VERSION" ]; then
-    echo -e "${RED}Error: PostgreSQL is not installed${NC}"
-    echo "Please install PostgreSQL first:"
-    echo "  sudo apt update"
-    echo "  sudo apt install -y postgresql postgresql-contrib"
+    echo -e "${RED}Error: PostgreSQL is not installed (psql not found)${NC}"
     exit 1
 fi
 
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}PostgreSQL Instance Manager${NC}"
-echo -e "${BLUE}========================================${NC}"
-echo ""
-echo "PostgreSQL Version: ${POSTGRES_VERSION}"
-echo ""
+check_mount_point() {
+    local mountpoint=$1
+    if ! mountpoint -q "$mountpoint"; then return 1; fi
+    return 0
+}
 
-# Function to initialize a new PostgreSQL instance
+ensure_filesystems() {
+    local ready=true
+    if ! check_mount_point "${SWORNDISK_MOUNT}"; then ready=false; fi
+    if ! check_mount_point "${CRYPTDISK_MOUNT}"; then ready=false; fi
+
+    if [ "$ready" = false ]; then
+        echo -e "${RED}Error: Filesystems not mounted at ${SWORNDISK_MOUNT} and/or ${CRYPTDISK_MOUNT}${NC}"
+        echo -e "${YELLOW}Please mount them first (e.g., run ${MOUNT_SCRIPT})${NC}"
+        exit 1
+    fi
+}
+
+reset_sworndisk() {
+    if [ -x "${RESET_SWORN_SCRIPT}" ]; then
+        echo -e "${YELLOW}Resetting sworndisk...${NC}"
+        bash "${RESET_SWORN_SCRIPT}" || echo -e "${RED}Failed to reset sworndisk${NC}"
+    else
+        echo -e "${YELLOW}Reset script not found at ${RESET_SWORN_SCRIPT}${NC}"
+    fi
+}
+
+instance_running() {
+    local data_dir=$1
+    if [ -f "${data_dir}/postmaster.pid" ]; then
+        local pid
+        pid=$(head -1 "${data_dir}/postmaster.pid")
+        if ps -p $pid > /dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+ensure_writable_dir() {
+    local dir=$1
+    mkdir -p "${dir}" 2>/dev/null || sudo mkdir -p "${dir}"
+    
+    if [ "$EUID" -eq 0 ]; then
+        chown -R ${POSTGRES_USER}:${POSTGRES_USER} "${dir}"
+    else
+        sudo chown -R ${POSTGRES_USER}:${POSTGRES_USER} "${dir}"
+    fi
+}
+
+# Pre-checks
+ensure_filesystems
+mkdir -p "${SWORNDISK_DATA_ROOT}" "${CRYPTDISK_DATA_ROOT}"
+
 init_instance() {
     local name=$1
     local data_dir=$2
     local port=$3
     local instance_cmd=$(echo "$name" | tr '[:upper:]' '[:lower:]')
 
-    echo -e "${YELLOW}========================================${NC}"
     echo -e "${YELLOW}Initializing PostgreSQL for ${name}${NC}"
-    echo -e "${YELLOW}========================================${NC}"
-    echo ""
-    echo "Data Directory: ${data_dir}"
-    echo "Port: ${port}"
-    echo ""
 
-    # Create directory
-    echo -e "${YELLOW}[1/4] Creating data directory...${NC}"
-    mkdir -p "${data_dir}"
+    # 1. Create directory and set ownership BEFORE initdb
+    echo -e "${YELLOW}[1/4] Preparing data directory...${NC}"
+    ensure_writable_dir "${data_dir}"
 
-    # Check if already initialized
     if [ -f "${data_dir}/PG_VERSION" ]; then
-        echo -e "${YELLOW}PostgreSQL instance already initialized in ${data_dir}${NC}"
-        echo "Skipping initialization."
+        echo -e "${YELLOW}Already initialized.${NC}"
         return 0
     fi
 
-    # Set ownership (if running as root)
-    if [ "$EUID" -eq 0 ]; then
-        chown -R ${POSTGRES_USER}:${POSTGRES_USER} "${data_dir}"
-        echo -e "${GREEN}✓ Directory created and ownership set${NC}"
-    else
-        echo -e "${GREEN}✓ Directory created${NC}"
-    fi
-    echo ""
-
-    # Initialize database cluster
+    # 2. Initialize database cluster
     echo -e "${YELLOW}[2/4] Initializing database cluster...${NC}"
+    # Use LC_ALL=C to avoid locale issues in minimal VMs
     if [ "$EUID" -eq 0 ]; then
-        sudo -u ${POSTGRES_USER} /usr/lib/postgresql/${POSTGRES_VERSION}/bin/initdb -D "${data_dir}"
+        sudo -u ${POSTGRES_USER} LC_ALL=C /usr/lib/postgresql/${POSTGRES_VERSION}/bin/initdb -D "${data_dir}"
     else
-        /usr/lib/postgresql/${POSTGRES_VERSION}/bin/initdb -D "${data_dir}"
+        LC_ALL=C /usr/lib/postgresql/${POSTGRES_VERSION}/bin/initdb -D "${data_dir}"
     fi
-    echo -e "${GREEN}✓ Database cluster initialized${NC}"
-    echo ""
+    echo -e "${GREEN}✓ Initialized${NC}"
 
-    # Configure PostgreSQL
+    # 3. Configure PostgreSQL
     echo -e "${YELLOW}[3/4] Configuring PostgreSQL...${NC}"
-
-    # Update port
     sed -i "s/#port = 5432/port = ${port}/" "${data_dir}/postgresql.conf"
-
-    # Update listen_addresses to allow connections
     sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "${data_dir}/postgresql.conf"
-
-    # Update socket directory to avoid conflicts
+    
+    # Custom socket dir to avoid /var/run permissions issues
     mkdir -p "${data_dir}/run"
+    chown ${POSTGRES_USER}:${POSTGRES_USER} "${data_dir}/run"
     sed -i "s|#unix_socket_directories = '/var/run/postgresql'|unix_socket_directories = '${data_dir}/run'|" "${data_dir}/postgresql.conf"
 
-    echo -e "${GREEN}✓ Configuration updated${NC}"
-    echo "  Port: ${port}"
-    echo "  Socket: ${data_dir}/run"
-    echo ""
+    # [CRITICAL] Allow TCP connections without password (trust) for testing
+    echo "" >> "${data_dir}/pg_hba.conf"
+    echo "# ALLOW ALL REMOTE ACCESS FOR TESTING" >> "${data_dir}/pg_hba.conf"
+    echo "host    all             all             0.0.0.0/0               trust" >> "${data_dir}/pg_hba.conf"
+    echo "host    all             all             ::/0                    trust" >> "${data_dir}/pg_hba.conf"
 
-    # Set permissions
-    echo -e "${YELLOW}[4/4] Setting permissions...${NC}"
+    echo -e "${GREEN}✓ Configuration updated (Trust Auth Enabled)${NC}"
+
+    # 4. Set permissions
     chmod 700 "${data_dir}"
-    if [ "$EUID" -eq 0 ]; then
-        chown -R ${POSTGRES_USER}:${POSTGRES_USER} "${data_dir}"
-    fi
     echo -e "${GREEN}✓ Permissions set${NC}"
-    echo ""
-
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}Initialization complete!${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Start the instance: $0 start ${instance_cmd}"
-    echo "  2. Initialize YCSB database: $0 init-ycsb ${instance_cmd}"
-    echo ""
 }
 
-# Function to start PostgreSQL instance
 start_instance() {
     local name=$1
     local data_dir=$2
@@ -131,7 +159,6 @@ start_instance() {
     echo -e "${YELLOW}Starting PostgreSQL instance: ${name}${NC}"
     echo "Data Directory: ${data_dir}"
     echo "Port: ${port}"
-    echo ""
 
     if [ ! -f "${data_dir}/PG_VERSION" ]; then
         echo -e "${RED}Error: PostgreSQL instance not initialized${NC}"
@@ -141,7 +168,6 @@ start_instance() {
 
     # Check if already running
     if [ -f "${data_dir}/postmaster.pid" ]; then
-        echo -e "${YELLOW}Instance appears to be already running${NC}"
         local pid=$(head -1 "${data_dir}/postmaster.pid")
         if ps -p $pid > /dev/null 2>&1; then
             echo -e "${GREEN}PostgreSQL is running (PID: ${pid})${NC}"
@@ -159,16 +185,12 @@ start_instance() {
     fi
 
     # Start PostgreSQL
+    local START_CMD="/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl -D ${data_dir} -l ${data_dir}/postgresql.log start"
+    
     if [ "$EUID" -eq 0 ]; then
-        sudo -u ${POSTGRES_USER} /usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl \
-            -D "${data_dir}" \
-            -l "${data_dir}/postgresql.log" \
-            start
+        sudo -u ${POSTGRES_USER} bash -c "$START_CMD"
     else
-        /usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl \
-            -D "${data_dir}" \
-            -l "${data_dir}/postgresql.log" \
-            start
+        eval "$START_CMD"
     fi
 
     sleep 2
@@ -178,17 +200,7 @@ start_instance() {
         local pid=$(head -1 "${data_dir}/postmaster.pid")
         if ps -p $pid > /dev/null 2>&1; then
             echo -e "${GREEN}✓ PostgreSQL started successfully (PID: ${pid})${NC}"
-            echo ""
-            echo "Connection info:"
-            echo "  Host: localhost"
-            echo "  Port: ${port}"
-            echo "  Socket: ${data_dir}/run"
-            echo ""
-            echo "Connect with:"
-            echo "  psql -h localhost -p ${port} -U ${USER} postgres"
-            echo ""
-            echo "To initialize YCSB database:"
-            echo "  $0 init-ycsb ${instance_cmd}"
+            echo "Socket: ${data_dir}/run"
             return 0
         fi
     fi
@@ -198,34 +210,28 @@ start_instance() {
     return 1
 }
 
-# Function to stop PostgreSQL instance
 stop_instance() {
     local name=$1
     local data_dir=$2
 
     echo -e "${YELLOW}Stopping PostgreSQL instance: ${name}${NC}"
-    echo "Data Directory: ${data_dir}"
-    echo ""
 
     if [ ! -f "${data_dir}/postmaster.pid" ]; then
         echo -e "${YELLOW}Instance is not running${NC}"
         return 0
     fi
 
+    local STOP_CMD="/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl -D ${data_dir} stop"
+
     if [ "$EUID" -eq 0 ]; then
-        sudo -u ${POSTGRES_USER} /usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl \
-            -D "${data_dir}" \
-            stop
+        sudo -u ${POSTGRES_USER} bash -c "$STOP_CMD"
     else
-        /usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_ctl \
-            -D "${data_dir}" \
-            stop
+        eval "$STOP_CMD"
     fi
 
     echo -e "${GREEN}✓ PostgreSQL stopped${NC}"
 }
 
-# Function to show instance status
 status_instance() {
     local name=$1
     local data_dir=$2
@@ -234,43 +240,27 @@ status_instance() {
     echo -e "${BLUE}========================================${NC}"
     echo -e "${BLUE}PostgreSQL Instance: ${name}${NC}"
     echo -e "${BLUE}========================================${NC}"
-    echo ""
     echo "Data Directory: ${data_dir}"
     echo "Port: ${port}"
-    echo ""
 
     if [ ! -f "${data_dir}/PG_VERSION" ]; then
-        echo "Status: ${RED}Not initialized${NC}"
-        echo ""
-        echo "Initialize with: $0 init ${name}"
+        echo -e "Status: ${RED}Not initialized${NC}"
         return
     fi
-
-    echo "PostgreSQL Version: $(cat ${data_dir}/PG_VERSION)"
-    echo ""
 
     if [ -f "${data_dir}/postmaster.pid" ]; then
         local pid=$(head -1 "${data_dir}/postmaster.pid")
         if ps -p $pid > /dev/null 2>&1; then
-            echo "Status: ${GREEN}Running${NC}"
-            echo "PID: ${pid}"
-            echo ""
-            echo "Connection info:"
-            echo "  psql -h localhost -p ${port} -U ${USER} postgres"
+            echo -e "Status: ${GREEN}Running (PID: ${pid})${NC}"
         else
-            echo "Status: ${RED}Stopped (stale PID file)${NC}"
+            echo -e "Status: ${RED}Stopped (stale PID file)${NC}"
         fi
     else
-        echo "Status: ${RED}Stopped${NC}"
+        echo -e "Status: ${RED}Stopped${NC}"
     fi
-
-    echo ""
-    echo "Disk Usage:"
-    du -sh "${data_dir}" 2>/dev/null || echo "Unable to read directory"
     echo ""
 }
 
-# Function to initialize YCSB database
 init_ycsb_db() {
     local name=$1
     local data_dir=$2
@@ -279,81 +269,39 @@ init_ycsb_db() {
     echo -e "${YELLOW}========================================${NC}"
     echo -e "${YELLOW}Initializing YCSB Database: ${name}${NC}"
     echo -e "${YELLOW}========================================${NC}"
-    echo ""
 
-    # Check if instance is running
-    if [ ! -f "${data_dir}/postmaster.pid" ]; then
-        echo -e "${RED}Error: PostgreSQL instance is not running${NC}"
-        echo "Start it first: $0 start ${name}"
-        return 1
-    fi
-
-    local pid=$(head -1 "${data_dir}/postmaster.pid")
-    if ! ps -p $pid > /dev/null 2>&1; then
-        echo -e "${RED}Error: PostgreSQL instance is not running${NC}"
-        echo "Start it first: $0 start ${name}"
+    if ! instance_running "${data_dir}"; then
+        echo -e "${RED}Error: PostgreSQL instance is not running. Start it first.${NC}"
         return 1
     fi
 
     echo "Creating YCSB database and user..."
-    echo ""
+    
+    # Using Unix Socket explicitly to avoid TCP Auth issues during setup
+    # Host is set to the custom socket directory
+    local SOCKET_DIR="${data_dir}/run"
+    
+    local SQL_CMDS="
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = 'root') THEN
+            CREATE USER root WITH PASSWORD 'root';
+        END IF;
+    END
+    \$\$;
+    SELECT 'CREATE DATABASE test OWNER root' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'test')\gexec
+    GRANT ALL PRIVILEGES ON DATABASE test TO root;
+    "
 
-    # Create user and database
     if [ "$EUID" -eq 0 ]; then
-        # Running as root, use postgres user
-        sudo -u ${POSTGRES_USER} psql -h localhost -p ${port} -d postgres > /dev/null 2>&1 <<EOF
--- Create user if not exists
-DO \$\$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = 'root') THEN
-        CREATE USER root WITH PASSWORD 'root';
-    END IF;
-END
-\$\$;
-
--- Create database if not exists
-SELECT 'CREATE DATABASE test OWNER root'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'test')\gexec
-
--- Grant privileges
-GRANT ALL PRIVILEGES ON DATABASE test TO root;
-EOF
+        echo "$SQL_CMDS" | sudo -u ${POSTGRES_USER} psql -h "${SOCKET_DIR}" -p ${port} -d postgres -f - > /dev/null 2>&1
     else
-        # Running as current user
-        psql -h localhost -p ${port} -d postgres > /dev/null 2>&1 <<EOF
--- Create user if not exists
-DO \$\$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = 'root') THEN
-        CREATE USER root WITH PASSWORD 'root';
-    END IF;
-END
-\$\$;
-
--- Create database if not exists
-SELECT 'CREATE DATABASE test OWNER root'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'test')\gexec
-
--- Grant privileges
-GRANT ALL PRIVILEGES ON DATABASE test TO root;
-EOF
+        echo "$SQL_CMDS" | psql -h "${SOCKET_DIR}" -p ${port} -d postgres -f - > /dev/null 2>&1
     fi
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}✓ YCSB database initialized successfully${NC}"
-        echo ""
-        echo "Database Details:"
-        echo "  Database: test"
-        echo "  User: root"
-        echo "  Password: root"
-        echo "  Host: localhost"
-        echo "  Port: ${port}"
-        echo ""
-        echo "Connect with:"
-        echo "  psql -h localhost -p ${port} -U root -d test"
-        echo ""
-        echo "YCSB connection string:"
-        echo "  postgresql://root:root@localhost:${port}/test"
+        echo "  URL: postgresql://root:root@localhost:${port}/test"
     else
         echo -e "${RED}Failed to initialize YCSB database${NC}"
         echo "Check PostgreSQL log: ${data_dir}/postgresql.log"
@@ -361,7 +309,6 @@ EOF
     fi
 }
 
-# Function to clean instance (remove all data)
 clean_instance() {
     local name=$1
     local data_dir=$2
@@ -369,9 +316,7 @@ clean_instance() {
     echo -e "${RED}========================================${NC}"
     echo -e "${RED}WARNING: Clean Instance${NC}"
     echo -e "${RED}========================================${NC}"
-    echo ""
     echo "This will DELETE all data in: ${data_dir}"
-    echo ""
     read -p "Are you sure? Type 'yes' to confirm: " confirm
 
     if [ "$confirm" != "yes" ]; then
@@ -379,9 +324,7 @@ clean_instance() {
         return
     fi
 
-    # Stop if running
     if [ -f "${data_dir}/postmaster.pid" ]; then
-        echo "Stopping instance first..."
         stop_instance "$name" "$data_dir"
         sleep 2
     fi
@@ -395,141 +338,68 @@ clean_instance() {
 case "${1:-}" in
     init)
         case "${2:-}" in
-            sworndisk)
-                init_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
-                ;;
-            cryptdisk)
-                init_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
-                ;;
-            *)
-                echo "Usage: $0 init [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            sworndisk) init_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT" ;;
+            cryptdisk) init_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT" ;;
+            *) echo "Usage: $0 init [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     start)
         case "${2:-}" in
-            sworndisk)
-                start_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
-                ;;
-            cryptdisk)
-                start_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
-                ;;
-            *)
-                echo "Usage: $0 start [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            sworndisk) start_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT" ;;
+            cryptdisk) start_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT" ;;
+            *) echo "Usage: $0 start [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     stop)
         case "${2:-}" in
-            sworndisk)
-                stop_instance "SwornDisk" "$SWORNDISK_DIR"
-                ;;
-            cryptdisk)
-                stop_instance "CryptDisk" "$CRYPTDISK_DIR"
-                ;;
-            *)
-                echo "Usage: $0 stop [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            sworndisk) stop_instance "SwornDisk" "$SWORNDISK_DIR" ;;
+            cryptdisk) stop_instance "CryptDisk" "$CRYPTDISK_DIR" ;;
+            *) echo "Usage: $0 stop [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     restart)
         case "${2:-}" in
-            sworndisk)
+            sworndisk) 
                 stop_instance "SwornDisk" "$SWORNDISK_DIR"
                 sleep 2
                 start_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
                 ;;
-            cryptdisk)
+            cryptdisk) 
                 stop_instance "CryptDisk" "$CRYPTDISK_DIR"
                 sleep 2
                 start_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
                 ;;
-            *)
-                echo "Usage: $0 restart [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            *) echo "Usage: $0 restart [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     status)
         case "${2:-}" in
-            sworndisk)
-                status_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
-                ;;
-            cryptdisk)
-                status_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
-                ;;
-            all|"")
+            sworndisk) status_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT" ;;
+            cryptdisk) status_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT" ;;
+            all|"") 
                 status_instance "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
                 status_instance "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
-                ;;
-            *)
-                echo "Usage: $0 status [sworndisk|cryptdisk|all]"
-                exit 1
                 ;;
         esac
         ;;
-
     init-ycsb)
         case "${2:-}" in
-            sworndisk)
-                init_ycsb_db "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT"
-                ;;
-            cryptdisk)
-                init_ycsb_db "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT"
-                ;;
-            *)
-                echo "Usage: $0 init-ycsb [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            sworndisk) init_ycsb_db "SwornDisk" "$SWORNDISK_DIR" "$SWORNDISK_PORT" ;;
+            cryptdisk) init_ycsb_db "CryptDisk" "$CRYPTDISK_DIR" "$CRYPTDISK_PORT" ;;
+            *) echo "Usage: $0 init-ycsb [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     clean)
         case "${2:-}" in
-            sworndisk)
-                clean_instance "SwornDisk" "$SWORNDISK_DIR"
-                ;;
-            cryptdisk)
-                clean_instance "CryptDisk" "$CRYPTDISK_DIR"
-                ;;
-            *)
-                echo "Usage: $0 clean [sworndisk|cryptdisk]"
-                exit 1
-                ;;
+            sworndisk) clean_instance "SwornDisk" "$SWORNDISK_DIR" ;;
+            cryptdisk) clean_instance "CryptDisk" "$CRYPTDISK_DIR" ;;
+            *) echo "Usage: $0 clean [sworndisk|cryptdisk]"; exit 1 ;;
         esac
         ;;
-
     *)
-        echo "PostgreSQL Instance Manager"
-        echo ""
+        echo "PostgreSQL Instance Manager for SwornDisk Env"
         echo "Usage: $0 <command> <instance>"
-        echo ""
-        echo "Commands:"
-        echo "  init <instance>      - Initialize a new PostgreSQL instance"
-        echo "  start <instance>     - Start PostgreSQL instance"
-        echo "  stop <instance>      - Stop PostgreSQL instance"
-        echo "  restart <instance>   - Restart PostgreSQL instance"
-        echo "  status [instance]    - Show instance status (default: all)"
-        echo "  init-ycsb <instance> - Initialize YCSB database (user: root, db: test)"
-        echo "  clean <instance>     - Remove instance data (WARNING: deletes all data)"
-        echo ""
-        echo "Instances:"
-        echo "  sworndisk           - SwornDisk instance (port ${SWORNDISK_PORT})"
-        echo "  cryptdisk           - CryptDisk instance (port ${CRYPTDISK_PORT})"
-        echo ""
-        echo "Examples:"
-        echo "  $0 init sworndisk"
-        echo "  $0 start sworndisk"
-        echo "  $0 init-ycsb sworndisk"
-        echo "  $0 status"
-        echo "  $0 stop cryptdisk"
+        echo "Commands: init, start, stop, restart, status, init-ycsb, clean"
         exit 1
         ;;
 esac
